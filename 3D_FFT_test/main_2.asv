@@ -1,0 +1,189 @@
+%% main_3dfft_manual.m
+
+clc;
+clear;
+rng(42)
+% Load simulation parameters
+run("parameters.m");
+
+% Generate manual RT database if needed
+if ~isfile("RTDB_manual_5groups.mat")
+    fprintf("RTDB_manual_5groups.mat not found. Generate manual RTDB first...\n");
+    run("step1_save_manual_db.m");
+end
+if ~isfile("RTDB_5points_circle.mat")
+    fprintf("RTDB_5points_circle.mat not found. Generate manual RTDB first...\n");
+    run("step1_save_manual_db.m");
+end
+% Load manual RT database
+%load("RTDB_manual_5groups.mat", "RTDB");
+load("RTDB_5points_circle.mat", "RTDB");
+% SNR and pilot settings
+snr_dB_list = 0:2:30;
+numPilots = round(0 * Nc);
+pilots = round(linspace(1, Nc, numPilots));
+pilots = unique(pilots);
+
+OS_x = 1;
+OS_y = 1;
+OS_delay = 1;
+
+RESULT = struct();
+
+fprintf("========== Start 3D-FFT with manual RTDB ==========\n");
+
+for a = 1:length(RTDB)
+    fprintf("\n>>> Process group %d/%d\n", a, length(RTDB));
+    ip = a;
+
+    % Ground-truth path parameters
+    rt_true = RTDB(a).true;
+    az_true = rt_true.AoA_az(:);
+    el_true = rt_true.AoA_el(:);
+    tau_true = rt_true.ToA(:);
+    alpha_true = rt_true.alpha(:);
+
+    % Build full channel
+    H_true = build_channel_from_rt(rt_true, UE_Rx, Rx_ant_spacing, Nc, Ts);
+
+    % Keep pilot subcarriers only
+    H_incomplete = nan(size(H_true));
+    H_incomplete(:, :, pilots) = H_true(:, :, pilots);
+
+    % Save common data
+    RESULT(a).A_index = a;
+    RESULT(a).rt_true = rt_true;
+    RESULT(a).pilots = pilots;
+    RESULT(a).H_true = H_true;
+    RESULT(a).H_incomplete = H_incomplete;
+
+    for is = 1:length(snr_dB_list)
+        snr_dB = snr_dB_list(is);
+        fprintf("    -> SNR = %d dB\n", snr_dB);
+
+        W_mc = zeros(numMC, 1);
+        theta_mse_mc = zeros(numMC, 1);
+        phi_mse_mc = zeros(numMC, 1);
+        tau_mse_mc = zeros(numMC, 1);
+        alpha_nmse_mc = zeros(numMC, 1);
+
+        for imc = 1:numMC
+            % Add noise
+            H_noisy = add_noise_on_observed_entries(H_incomplete, snr_dB);
+
+            % Interpolate channel
+            H_interp = local_interp_channel(H_noisy, pilots, Nc);
+
+            % 3D-FFT estimation
+            num_peaks = max(1, numel(alpha_true));
+
+            target_point = 1;
+            target_snr = 30;
+            target_mc = 2;
+
+            do_plot = (ip == target_point) && ...
+                      (snr_dB_list(is) == target_snr) && ...
+                      (imc == target_mc);
+            save_plot = do_plot;
+            plot_tag = sprintf('point%d_snr%d_mc%d', ip, snr_dB_list(is), imc);
+
+            est = estimate_params_3dfft_4( ...
+                H_interp, Rx_ant_spacing, B, ...
+                OS_x, OS_y, OS_delay, num_peaks, ...
+                do_plot, save_plot, "spectrum_debug", plot_tag, ...
+                az_true, el_true, tau_true);
+
+            % Wasserstein distance and path matching
+            [W, pairs] = joint_wasserstein_optimal_3d( ...
+                az_true, el_true, tau_true, alpha_true, ...
+                est.az, est.el, est.tau, est.alpha);
+            W_mc(imc) = W;
+
+            % Sort by true-path index, then save estimates in matched order
+            if ~isempty(pairs)
+                pairs_sorted = sortrows(pairs, 1);
+                idx_t = pairs_sorted(:, 1);
+                idx_e = pairs_sorted(:, 2);
+            else
+                pairs_sorted = zeros(0, 2);
+                idx_t = zeros(0, 1);
+                idx_e = zeros(0, 1);
+            end
+
+            est_matched = est;
+            est_matched.az = est.az(idx_e);
+            est_matched.el = est.el(idx_e);
+            est_matched.tau = est.tau(idx_e);
+            est_matched.alpha = est.alpha(idx_e);
+            est_matched.ix = est.ix(idx_e);
+            est_matched.iy = est.iy(idx_e);
+            est_matched.itau = est.itau(idx_e);
+
+            RESULT(a).snr(is).MC(imc).est = est_matched;
+            RESULT(a).snr(is).MC(imc).W = W;
+            RESULT(a).snr(is).MC(imc).pairs = pairs_sorted;
+
+            % Matched-parameter errors
+            az_t = az_true(idx_t);
+            az_e = est_matched.az;
+            el_t = el_true(idx_t);
+            el_e = est_matched.el;
+            tau_t = tau_true(idx_t);
+            tau_e = est_matched.tau;
+            alpha_t = alpha_true(idx_t);
+            alpha_e = est_matched.alpha;
+
+            dtheta = mod((az_e - az_t) + 180, 360) - 180;
+            dphi = el_e - el_t;
+            dtau = tau_e - tau_t;
+
+            theta_mse_mc(imc) = mean(dtheta .^ 2);
+            phi_mse_mc(imc) = mean(dphi .^ 2);
+            tau_mse_mc(imc) = mean(dtau .^ 2);
+            alpha_nmse_mc(imc) = sum(abs(alpha_e - alpha_t) .^ 2) / ...
+                max(sum(abs(alpha_t) .^ 2), 1e-12);
+
+            % Save one example per SNR
+            if imc == 1
+                RESULT(a).snr(is).H_noisy_example = H_noisy;
+                RESULT(a).snr(is).H_interp_example = H_interp;
+                RESULT(a).snr(is).est_example = est_matched;
+                RESULT(a).snr(is).pairs_example = pairs_sorted;
+            end
+        end
+
+        % Monte Carlo averages
+        RESULT(a).snr(is).snr_dB = snr_dB;
+        RESULT(a).snr(is).W = mean(W_mc, "omitnan");
+        RESULT(a).snr(is).theta_rmse = sqrt(mean(theta_mse_mc, "omitnan"));
+        RESULT(a).snr(is).phi_rmse = sqrt(mean(phi_mse_mc, "omitnan"));
+        RESULT(a).snr(is).tau_rmse = sqrt(mean(tau_mse_mc, "omitnan"));
+        RESULT(a).snr(is).alpha_nmse = mean(alpha_nmse_mc, "omitnan");
+    end
+end
+
+% Save result
+%save("RESULT_3DFFT_manual.mat", "RESULT", "-v7.3");
+save("RESULT_3DFFT_rt.mat", "RESULT", "-v7.3");
+fprintf("\n========== Simulation finished ==========\n");
+fprintf("Saved result: RESULT_3DFFT_manual.mat\n");
+
+function H_interp = local_interp_channel(H_noisy, pilots, Nc)
+
+    [Nx, Ny, ~] = size(H_noisy);
+    H_interp = zeros(size(H_noisy));
+    xq = 1:Nc;
+
+    for ix = 1:Nx
+        for iy = 1:Ny
+            y_obs = squeeze(H_noisy(ix, iy, pilots));
+
+            if numel(pilots) < 2
+                H_interp(ix, iy, :) = H_noisy(ix, iy, :);
+            else
+                y_interp = interp1(pilots, y_obs, xq, "linear", "extrap");
+                H_interp(ix, iy, :) = reshape(y_interp, 1, 1, []);
+            end
+        end
+    end
+end
